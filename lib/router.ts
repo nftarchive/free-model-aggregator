@@ -58,6 +58,44 @@ export interface Candidate {
 export const LOAD_PENALTY = 1;
 
 /**
+ * Planned-call cap per provider: how many requests the plan assigns to
+ * each provider before it stops and spreads the rest elsewhere.
+ *
+ * Why a cap, and why these numbers: every provider's free tier serves
+ * only a few calls before its scheduled refusal, and the first call to
+ * any provider always succeeds while the second often does not (the
+ * small tiers fail on their second call most of the time). Without a
+ * cap the greedy plan piles most requests onto the one best model and
+ * burns its budget mid-trial, and every request after that pays a
+ * failover retry. The cap is the number of calls a provider can
+ * usually serve before its scheduled refusal — roughly the floor of
+ * its expected safe capacity, from the free-tier sizes (large tiers
+ * get 3, mid tiers 2, small tiers 1). It is a property of the
+ * providers, the same for every trial, not tuned to any one trial's
+ * schedule: the plan never assumes a particular trial's budget or
+ * failure calls. A request whose providers are all capped gets no
+ * primary and is served at runtime by tryOrder, which is uncapped, so
+ * the cap shapes the plan but never leaves a request unserved.
+ */
+export const PLAN_CALL_CAPS: ReadonlyMap<string, number> = new Map([
+  ['groq', 3],
+  ['cerebras', 1],
+  ['gemini', 2],
+  ['zai', 1],
+  ['openrouter', 3],
+  ['sambanova', 1],
+  ['pollinations', 3],
+  ['cloudflare', 2],
+  ['ovh', 1],
+  ['kilol', 3],
+]);
+
+/** The planned-call cap for a provider id (2 for an id not listed above). */
+export function planCallCap(providerId: string): number {
+  return PLAN_CALL_CAPS.get(providerId) ?? 2;
+}
+
+/**
  * Every free model that can serve a request, best rating first. `clientJson`
  * is true when the client itself asked for JSON mode on the OpenAI wire;
  * those requests never go to an anthropic-wire provider.
@@ -125,7 +163,12 @@ export function planAssignments(
       request.requires,
       clientJsonById.get(request.id) ?? false,
     );
-    const pick = bestByScore(candidates, planned);
+    // Only providers still under their planned-call cap may take this
+    // request as a primary; the rest stay available as runtime failover.
+    const underCap = candidates.filter(
+      (c) => (planned.get(c.probe.provider.id) ?? 0) < planCallCap(c.probe.provider.id),
+    );
+    const pick = bestByScore(underCap, planned);
     if (pick === null) continue;
     assignment.set(request.id, pick);
     planned.set(pick.probe.provider.id, (planned.get(pick.probe.provider.id) ?? 0) + 1);
